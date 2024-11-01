@@ -12,4 +12,3 @@ Notes:
 *scKaminski_analysis.Rmd* contains further analysis for scKaminski dataset relevant to the deconvolution.  
 
 *validation_scKropski.Rmd* contains the validation analysis.
-
