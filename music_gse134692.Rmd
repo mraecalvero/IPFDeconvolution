@@ -1,0 +1,875 @@
+---
+title: "MuSiC Deconvolution of GSE134692"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r, message=F, include=F}
+
+library(nnls)
+library(xbioc)
+library(MuSiC)
+library(Biobase)
+library(reshape2)
+library(ggpubr)
+library(pheatmap)
+library(edgeR)
+library(ggrepel)
+library(ggplot2)
+library(tidyverse)
+library(rstatix)
+library(enrichR)
+library(viridis)
+library(factoextra)
+library(cowplot)
+library(ggvenn)
+library(ggExtra)
+library(RColorBrewer)
+library(egg)
+library(openxlsx)
+library(readr)
+
+```
+
+
+```{r, echo=F}
+
+bulkRaw <- read.table("/mnt/dzl_bioinf/FibrOmics/data/bulk/raw_data/PRJNA556144_Transplant_lung/GSE134692_raw_counts.txt.gz", header=TRUE, row.names=1)
+geneAnno <- read.table("/mnt/dzl_bioinf/FibrOmics/data/bulk/raw_data/PRJNA556144_Transplant_lung/GSE134692_gene_annotation.txt.gz", header=TRUE)
+metadata <- read.table("/mnt/dzl_bioinf/FibrOmics/data/bulk/raw_data/PRJNA556144_Transplant_lung/GSE134692_design.txt.gz", header=TRUE, sep="\t")
+
+rownames(metadata) <- metadata$SampleName
+colnames(bulkRaw) <- metadata$SampleName[match(names(bulkRaw),metadata$sample_id)]
+
+# only keep IPF and controls
+bulkRaw <- bulkRaw[,!grepl("ALI", colnames(bulkRaw))]
+bulkRaw <- as.matrix(bulkRaw)
+
+metadata <- metadata[match(colnames(bulkRaw),row.names(metadata)),]
+meta <- data.frame(labelDescription=c("Characters", "Factor levels", "Factor levels", "Characters", "Characters", "Characters", "Characters", "Characters", "Numbers", "Factor levels", "Factor levels", "Factor levels", "Numbers", "Numbers", "Factor levels"))
+phenoData <- new("AnnotatedDataFrame", data=metadata, varMetadata=meta)
+
+
+# only IPF and control patients in sc data, also downsampled
+scKaminski <- readRDS("/mnt/dzl_bioinf/calverom/Deconvolution/Data/Lung_Kaminski_processed_subset_downsampled_new.rds")
+sc_genes <- read_tsv("/mnt/dzl_bioinf/FibrOmics/data/scSEQ/kaminski_GSE136831/features.tsv.gz", col_names=TRUE)
+# use ensembl id of genes
+newCounts <- scKaminski@assays$RNA@counts
+rownames(newCounts) <- sc_genes$Ensembl_GeneID[match(rownames(newCounts), sc_genes$HGNC_EnsemblAlt_GeneID)]
+
+df_sc <- data.frame(SampleID=scKaminski@meta.data$SampleID, Condition=scKaminski@meta.data$Disease, CellType=scKaminski@meta.data$CellType, cluster=scKaminski@meta.data$CellType_Category, row.names = row.names(scKaminski@meta.data))
+metaData_sc <- data.frame(labelDescription=c("Factor levels", "Factor levels","Factor levels", "Factor levels"))
+phenoData_sc <- new("AnnotatedDataFrame", data=df_sc, varMetadata=metaData_sc)
+scKaminski_eset <- ExpressionSet(assayData=as.matrix(newCounts), phenoData=phenoData_sc)
+
+```
+
+
+# QC, normalization of bulk data
+```{r}
+
+bulk <- DGEList(counts=bulkRaw, group=factor(metadata$DiseaseStatus, levels=c("Normal", "IPF")))
+bulk$genes <- geneAnno[,1:2]
+
+# Filter out genes
+keep <- filterByExpr(bulk, group=bulk$samples$group)
+bulkFiltered <- bulk[keep,,keep.lib.sizes=FALSE]
+gns <- geneAnno[match(rownames(bulkFiltered), geneAnno$ensembl),]
+
+# Normalization
+bulkFiltered <- calcNormFactors(bulkFiltered)
+bulkNormLog2cpm <- cpm(bulkFiltered, log=TRUE, normalized.lib.sizes=TRUE)
+
+# add other variables as columns in DGEList object
+bulkFiltered$samples$age <- metadata$Age
+bulkFiltered$samples$race <- factor(metadata$race, levels=c("African American", "Caucasian", "Other", "Unknown"))
+bulkFiltered$samples$gender <- factor(metadata$gender, levels=c("Female", "Male"))
+bulkFiltered$samples$tobacco <- factor(metadata$tobacco, levels=c("Never smoked", "Former smoker", "Active smoker"))
+bulkFiltered$samples$height <- metadata$height
+bulkFiltered$samples$weight <- metadata$weight
+bulkFiltered$samples$batch <- metadata$Batch
+
+bulkFiltered$genes <- data.frame(GeneName=bulkFiltered$genes[,"ensembl"])
+
+# bulk as ExpressionSet
+lung_transplant_eset <- ExpressionSet(assayData=bulkFiltered$counts, phenoData=phenoData)
+
+```
+
+
+```{r}
+
+Anno <- data.frame(Disease=metadata$DiseaseStatus, Smoking=metadata$tobacco, Gender=metadata$gender)
+Anno2 <- data.frame(Disease=metadata$DiseaseStatus, Smoking=metadata$tobacco, Gender=metadata$gender, Batch=factor(metadata$Batch))
+rownames(Anno) <- colnames(bulkNormLog2cpm)
+rownames(Anno2) <- colnames(bulkNormLog2cpm)
+# pheatmap(bulkNormLog2cpm, annotation_col = Anno, annotation_names_col = F, show_rownames = F, show_colnames=F, scale="row")
+# pheatmap(bulkNormLog2cpm, annotation_col = Anno2, annotation_names_col = F, show_rownames = F, show_colnames=F, scale="row")
+
+# keep only top 500 most variable genes in heatmap
+var_genes <- apply(bulkNormLog2cpm, 1, var)
+select_var <- names(sort(var_genes, decreasing=TRUE))[1:500]
+mostVar_lcpm <- bulkNormLog2cpm[select_var,]
+
+# pheatmap(mostVar_lcpm, annotation_col = Anno, annotation_names_col = F, show_rownames = F, show_colnames=F, scale="row", color = colorRampPalette(rev(brewer.pal(n =7, name = "PuOr")))(50)) # with row dendrogram
+
+pheatmap(mostVar_lcpm, annotation_col = Anno, annotation_names_col = FALSE, show_rownames = FALSE, show_colnames=FALSE, scale="row", treeheight_row = 0, color = colorRampPalette(rev(brewer.pal(n =7, name = "PuOr")))(50)) # without row dendrogram
+pheatmap(mostVar_lcpm, annotation_col = Anno2, annotation_names_col = FALSE, show_rownames = FALSE, show_colnames=FALSE, scale="row", treeheight_row = 0, color = colorRampPalette(rev(brewer.pal(n =7, name = "PuOr")))(50))
+
+# remove batch effect
+batch <- factor(metadata$Batch)
+mostVar_lcpm2 <- removeBatchEffect(mostVar_lcpm, batch=batch)
+#jpeg(filename="./supp_figures/heatmap_before.jpg", width=7.25, height=5, units="in", res=350)
+pheatmap(mostVar_lcpm2, annotation_col = Anno, annotation_names_col = FALSE, show_rownames = FALSE, show_colnames=FALSE, scale="row", treeheight_row = 0, color = colorRampPalette(rev(brewer.pal(n =7, name = "PuOr")))(50)) # without row dendrogram
+dev.off()
+
+pheatmap(mostVar_lcpm2, annotation_col = Anno2, annotation_names_col = FALSE, show_rownames = FALSE, show_colnames=FALSE, scale="row", treeheight_row = 0, color = colorRampPalette(rev(brewer.pal(n =7, name = "PuOr")))(50))
+
+
+# similarity between samples
+corr <- cor(mostVar_lcpm, method="spearman")
+d <- as.dist(1-corr)
+pheatmap(d, clustering_distance_rows=d, clustering_distance_cols=d, annotation_col=Anno2, show_colnames=FALSE, show_rownames=FALSE, annotation_names_col=FALSE, color = colorRampPalette(rev(brewer.pal(n =7, name = "PuOr")))(50))
+pheatmap(d, clustering_distance_rows=d, clustering_distance_cols=d, annotation_col=Anno, show_colnames=FALSE, show_rownames=FALSE, annotation_names_col=FALSE, color = colorRampPalette(rev(brewer.pal(n =7, name = "PuOr")))(50))
+
+# batch effect removed
+corr <- cor(mostVar_lcpm2, method="spearman")
+d <- as.dist(1-corr)
+pheatmap(d, clustering_distance_rows=d, clustering_distance_cols=d, annotation_col=Anno, show_colnames=FALSE, show_rownames=FALSE, annotation_names_col=FALSE, color = colorRampPalette(rev(brewer.pal(n =7, name = "PuOr")))(50))
+pheatmap(d, clustering_distance_rows=d, clustering_distance_cols=d, annotation_col=Anno2, show_colnames=FALSE, show_rownames=FALSE, annotation_names_col=FALSE, color = colorRampPalette(rev(brewer.pal(n =7, name = "PuOr")))(50))
+
+```
+
+
+# PCA on genes
+```{r}
+
+tbulk <- t(mostVar_lcpm)
+genePCA <- prcomp(tbulk)
+genePCAResSumm <- data.frame(PC=factor(1:nrow(tbulk)), t(summary(genePCA)$importance))
+genePCARes <- cbind(metadata, data.frame(genePCA$x))
+
+ggplot(genePCAResSumm[1:20,], aes(x=PC, y=Proportion.of.Variance, group=1)) + geom_point() + geom_line() + theme_classic()
+ggplot(genePCARes, aes(x=PC1, y=PC2, color=DiseaseStatus, shape=factor(Batch))) + geom_point() + scale_shape_manual(values=c(19,4)) + theme_classic()
+
+
+# remove batch effect
+batch <- factor(metadata$Batch)
+mostVar_lcpm2 <- removeBatchEffect(mostVar_lcpm, batch=batch)
+tbulk <- t(mostVar_lcpm2)
+genePCA <- prcomp(tbulk)
+genePCAResSumm <- data.frame(PC=factor(1:nrow(tbulk)), t(summary(genePCA)$importance))
+genePCARes <- cbind(metadata, data.frame(genePCA$x))
+a <- ggplot(genePCAResSumm[1:20,], aes(x=PC, y=Proportion.of.Variance, group=1)) + geom_point() + geom_line() + theme_classic()
+b <- ggplot(genePCARes, aes(x=PC1, y=PC2, color=DiseaseStatus, shape=factor(Batch))) + geom_point() + scale_shape_manual(values=c(19,4)) + theme_classic()
+c <- ggplot(genePCARes, aes(x=PC1, y=PC2, color=gender)) + geom_point() + theme_classic()
+d <- ggplot(genePCARes, aes(x=PC1, y=PC2, color=race)) + geom_point() + theme_classic()
+e <- ggplot(genePCARes, aes(x=PC1, y=PC2, color=tobacco)) + geom_point() + theme_classic()
+f <- ggplot(genePCARes, aes(x=PC1, y=PC2, color=Age)) + geom_point() + theme_classic()
+
+plt <- list(a,b,c,d,e,f)
+# for(pl in 1:length(plt)){
+#   ggsave(filename = paste("./supp_figures/scatter_",pl,".jpg",sep=""), plot = plt[[pl]], width=7, height=5, device="jpeg", dpi=350)
+# }
+
+```
+
+# Differential expression analysis, adjusting for other variables
+```{r}
+
+disease <- factor(bulkFiltered$samples$group, levels=c("Normal", "IPF"))
+age <- bulkFiltered$samples$age
+gender <- factor(bulkFiltered$samples$gender, levels=c("Female", "Male"))
+tobacco <- factor(bulkFiltered$samples$tobacco, levels=c("Never smoked", "Former smoker", "Active smoker"))
+batch <- factor(bulkFiltered$samples$batch, levels=c("1", "2"))
+
+design <- model.matrix(~0 + disease + age + gender + tobacco + batch)
+colnames(design) <- gsub("disease", "", colnames(design))
+colnames(design) <- gsub("tobacco", "", colnames(design))
+colnames(design)[5:6] <- c("Former_smoker", "Active_smoker") 
+colnames(design) <- gsub("gender", "", colnames(design))
+contrasts <- makeContrasts(IPF-Normal, levels = design)
+contrasts
+voom <- voom(bulkFiltered, design, plot=TRUE)
+
+vfit <- lmFit(voom, design)
+vfit <- contrasts.fit(vfit, contrasts=contrasts)
+efit <- eBayes(vfit)
+plotSA(efit)
+
+# Number of DE genes, adjusted p-value cutoff = 0.05
+edt <- decideTests(efit)
+summary(edt)
+
+upreg <- efit$genes$GeneName[which(edt[,1] == 1)]
+downreg <- efit$genes$GeneName[which(edt[,1] == -1)]
+res_before_adj <- topTable(efit, coef=1, n=Inf)
+res_before_adj
+# save de table
+#write.xlsx(res_before_adj, file="/mnt/dzl_bioinf/calverom/Deconvolution/music_gse134692_lung_transplant/supp_tables/DEtable_before_correction.xlsx", rowNames=FALSE, colNames=TRUE)
+
+DEgenes_before_adj <- c(downreg, upreg)
+dfDEgenes_before_adj <- res_before_adj[which(res_before_adj$GeneName %in% DEgenes_before_adj),]
+
+# volcano plot
+res_before_adj$updown <- ifelse(res_before_adj$GeneName %in% upreg, "up", ifelse(res_before_adj$GeneName %in% downreg, "down", "notSig"))
+res_before_adj$symbol <- geneAnno$GeneName[match(res_before_adj$GeneName, geneAnno$ensembl)]
+
+options(ggrepel.max.overlaps = Inf)
+#png(file="./poster2023/volc_before.png", height=7, width=9, units="in", res=300)
+ggplot(res_before_adj, aes(x=logFC, y=-log10(P.Value), color=updown, label=symbol)) + geom_point(cex=1) + geom_text_repel(data=res_before_adj[1:15,], aes(label=symbol), size=3) + scale_color_manual(values=c("#0571b0", "grey", "#ca0020"), guide="none") + theme_classic()
+#dev.off()
+#ggsave("./main_figures/volcano_before.jpg", width=7, height=5, device="jpeg", dpi=350)
+
+
+
+
+# Pie chart
+freq <- data.frame(summary(edt))
+freq <- droplevels(freq[freq$Var1 != "NotSig",])
+freq <- freq[order(freq$Var1, decreasing=TRUE),]
+freq$prop <- (freq$Freq / sum(freq$Freq))*100
+freq$ypos <- cumsum(freq$prop)- 0.5*freq$prop 
+ggplot(freq, aes(x="", y=prop, fill=Var1)) + geom_bar(stat="identity", width=1, color="white") + scale_fill_manual(values=c("blue", "red"), labels=c("Down-regulated", "Up-regulated")) + coord_polar("y", start=0) + theme_void() + geom_text(aes(y=ypos, label=Freq), color="white") + labs(fill="")
+
+# DE genes heatmap
+pheatmap(bulkNormLog2cpm[DEgenes_before_adj,], annotation_col = Anno2, show_rownames=FALSE, show_colnames=FALSE, annotation_names_col=FALSE, scale="row", treeheight_row = 0, color = colorRampPalette(rev(brewer.pal(n =7, name = "PuOr")))(50))
+# remove batch effect
+bb <- bulkNormLog2cpm[DEgenes_before_adj,]
+rem <- removeBatchEffect(bb, batch=batch)
+#jpeg(filename="./supp_figures/heatmap_before_DEGs.jpg", width=7.25, height=5, units="in", res=350)
+pheatmap(rem, annotation_col = Anno, show_rownames=FALSE, show_colnames=FALSE, annotation_names_col=FALSE, scale="row", treeheight_row = 0, color = colorRampPalette(rev(brewer.pal(n =7, name = "PuOr")))(50))
+dev.off()
+
+```
+
+
+## Enrichr, adjusted for variables
+```{r}
+
+setEnrichrSite("Enrichr")
+websiteLive <- TRUE
+dbs <- c("BioPlanet_2019", "WikiPathway_2021_Human", "Reactome_2016", "KEGG_2021_Human")
+DEgenes_before_adj_conv <- geneAnno$GeneName[match(DEgenes_before_adj, geneAnno$ensembl)] # convert to gene symbols
+
+path_before_adj <- enrichr(DEgenes_before_adj_conv, dbs)
+plotEnrich(path_before_adj$BioPlanet_2019, showTerms = 10, numChar=60, y = "Ratio", orderBy = "P.value", title="BioPlanet_2019") + scale_x_discrete(labels = function(x) str_wrap(x, width = 30)) + scale_fill_viridis(begin=0.4, option="A") + ggtitle("")
+#ggsave("./main_figures/pathways_before.jpg", width=7, height=5, device="jpeg", dpi=350)
+plotEnrich(path_before_adj$WikiPathway_2021_Human, showTerms = 10, numChar = 60, y = "Ratio", orderBy = "P.value", title="WikiPathway_2021_Human") + scale_x_discrete(labels = function(x) str_wrap(x, width = 30)) + scale_fill_viridis(begin=0.4, option="A")
+plotEnrich(path_before_adj$Reactome_2016, showTerms = 10, numChar=60, y = "Ratio", orderBy = "P.value", title="Reactome_2016") + scale_x_discrete(labels = function(x) str_wrap(x, width = 30)) + scale_fill_viridis(begin=0.4, option="A")
+plotEnrich(path_before_adj$KEGG_2021_Human, showTerms = 10, numChar=60, y = "Ratio", orderBy = "Adjusted.P.value", title="KEGG_2021_Human") + scale_x_discrete(labels = function(x) str_wrap(x, width = 30)) + scale_fill_viridis(begin=0.4, option="A")
+
+# save pathway table
+#write.xlsx(path_before_adj, file="/mnt/dzl_bioinf/calverom/Deconvolution/music_gse134692_lung_transplant/supp_tables/pathwaytable_before_correction.xlsx", rowNames=FALSE, colNames=TRUE)
+
+```
+
+
+# Deconvolution, using tree
+## New clusters
+  * Average gene expression per cell type \
+  * PCA on the genes, keep top PCs \
+  * hclust on new matrix: genes top PCs by cell type
+  * keep dendrogram of cell types (column), but original genes on rows in pheatmap
+```{r}
+
+# Seurat's AverageExpression() by cell type
+ave_exp <- readRDS("/mnt/dzl_bioinf/calverom/Deconvolution/music_ltrc/ave_by_celltype_counts.rds")
+gene_pc <- prcomp(t(ave_exp))
+summary(gene_pc)
+summ <- data.frame(PC=factor(1:ncol(ave_exp)), t(summary(gene_pc)$importance))
+
+ggplot(summ, aes(x=PC, y=Proportion.of.Variance, group=1)) + geom_point() + geom_line() + theme_classic()
+
+```
+
+```{r, fig.height=9, fig.width=9}
+
+# choose top 9 PCs
+sub <- gene_pc$x[,1:9] # row = cell types, col = PCs
+d <- dist(sub, method = "euclidean")
+dend <- hclust(d, method="complete")
+
+plot(dend, hang=-1)
+abline(h=10, col="blue", lty=2)
+
+mem10 <- cutree(dend, h=10)
+clustersh10 <- data.frame(Cluster = as.numeric(unlist(mem10)), CellType = names(mem10))
+clustersh10.list <- split(clustersh10$CellType, clustersh10$Cluster)
+names(clustersh10.list) <- paste("C", names(clustersh10.list), sep="")
+
+```
+
+```{r, fig.height=10, fig.width=11}
+
+pheatmap(ave_exp, cluster_cols=dend, scale="row", show_rownames=FALSE, treeheight_col = 150, cutree_cols = 20, color = colorRampPalette(rev(brewer.pal(n =7, name = "PuOr")))(50), treeheight_row=0)
+
+```
+
+```{r}
+
+# use new clusters
+new.markers <- readRDS("/mnt/dzl_bioinf/calverom/Deconvolution/music_ltrc/markers_by_newestclusters_Kaminski.rds")
+new.markers.list <- NULL
+for(cl in unique(new.markers$cluster)){
+  markrs <- new.markers$gene[new.markers$cluster == cl & new.markers$p_val_adj <= 0.05]
+  new.markers.list[[cl]] <- markrs
+}
+new.markers.list2 <- NULL
+for(cl in names(new.markers.list)){ # convert gene symbols to ensembl
+  new.markers.list2[[cl]] <- sc_genes$Ensembl_GeneID[match(new.markers.list[[cl]], sc_genes$HGNC_EnsemblAlt_GeneID)]
+}
+
+clusters <- c("Lymphatic", "VE_Venous", "VE_Arterial", "cMonocyte", "ncMonocyte", "Fibroblast", "Myofibroblast", "Basal", "Club", "Goblet", "Aberrant_Basaloid", "cDC2", "DC_Langerhans", "NK", "ILC_A", "T", "T_Cytotoxic", "ILC_B", "Mast", "ATI", "VE_Capillary_A", "VE_Capillary_B", "Macrophage_Alveolar", "Macrophage", "B_Plasma", "B", "T_Regulatory", "Mesothelial", "Ciliated", "ATII", "cDC1", "DC_Mature", "pDC", "SMC", "Pericyte", "VE_Peribronchial",  "Ionocyte", "PNEC")
+names(clusters) <- c(rep("C1", 3), rep("C2", 2), rep("C3", 2), rep("C4", 4), rep("C5", 2), rep("C6", 6), "C7", rep("C8", 2), rep("C9", 2), "C10", rep("C11",2), "C12", "C13", "C14", rep("C15", 2), "C16", rep("C17",2), "C18", "C19", "C20")
+scKaminski_eset$new_clusters <- as.character(names(clusters)[match(scKaminski_eset$CellType, clusters)])
+
+a <- Sys.time()
+musicRes_new <- music_prop.cluster(bulk.eset=lung_transplant_eset, sc.eset=scKaminski_eset, group.markers=new.markers.list2, clusters="CellType", groups="new_clusters", samples="SampleID", clusters.type=clustersh10.list, verbose=FALSE)
+b <- Sys.time()
+
+celltypes <- unique(scKaminski_eset$CellType)
+
+
+# save props table
+#write.xlsx(musicRes_new$Est.prop.weighted, file="/mnt/dzl_bioinf/calverom/Deconvolution/music_gse134692_lung_transplant/supp_tables/deconvolution_results.xlsx", rowNames=FALSE, colNames=TRUE)
+
+```
+
+```{r, fig.height=7, fig.width=9}
+
+dfEst <- data.frame(musicRes_new$Est.prop.weighted, Disease=factor(pData(lung_transplant_eset)$DiseaseStatus, levels=c("Normal", "IPF")), Age=pData(lung_transplant_eset)$Age, Race=factor(pData(lung_transplant_eset)$race), Gender=factor(pData(lung_transplant_eset)$gender), Tobacco=factor(pData(lung_transplant_eset)$tobacco), Height=pData(lung_transplant_eset)$height, Weight=pData(lung_transplant_eset)$weight, check.names=FALSE)
+dfEst
+
+# sorted by Control proportions
+melted <- melt(dfEst, id.vars=c("Disease", "Age", "Race", "Gender", "Tobacco", "Height", "Weight"))
+ord <- data.frame(dfEst %>% group_by(Disease) %>% summarize_at(vars(Lymphatic:PNEC), median), check.names=FALSE)
+ord <- melt(ord)
+ord <- ord[order(ord$Disease, -ord$value),]
+melted$variable <- factor(melted$variable, levels=unique(ord$variable))
+
+# no significance stars
+ggplot(melted, aes(x=variable, y=value)) + geom_boxplot(aes(color=Disease), position=position_dodge(1), outlier.size = 0.5) + scale_color_manual(values=rev(c("#B2182B", "#2166AC")),  guide = guide_legend(title = "")) + xlab("") + ylab("Estimated proportion") + theme_classic() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1), legend.position=c(0.95,0.9))
+
+
+# Not including cell types with all zero proportions
+colSum <- colSums(dfEst[,1:38])
+nonzeroCT <- names(colSum)[colSum != 0]
+tmp <- dfEst[,names(dfEst) %in% c(nonzeroCT, "Disease")]
+
+# sort by Control proportions
+melted <- melt(tmp)
+ord <- data.frame(tmp %>% group_by(Disease) %>% summarize_all("median"), check.names=FALSE)
+ord <- melt(ord)
+ord <- ord[order(ord$Disease, -ord$value),]
+names(melted)[2] <- "celltype"
+melted$celltype <- factor(melted$celltype, levels=unique(ord$variable))
+
+# without significance stars, p values as bars
+stat.test <- melted %>% group_by(celltype) %>% wilcox_test(value~Disease, exact=FALSE) %>% adjust_pvalue(method = "BH") %>% add_significance(p.col="p") %>% add_significance(p.col="p.adj")
+
+a <- ggplot(melted, aes(x=celltype, y=value)) + geom_boxplot(aes(color=Disease), position=position_dodge(1), outlier.size = 0.5) + scale_color_manual(values=rev(c("#B2182B", "#2166AC")),  guide = guide_legend(title = "")) + xlab("") + ylab("Estimated proportion") + theme_classic() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1), legend.position=c(0.95,0.9), plot.margin = unit(c(0.1,0.1,-0.95,0.1), "cm"))
+
+b <- ggplot(stat.test, aes(x=celltype, y=-log10(p))) + geom_bar(stat="identity", width=0.6) + scale_y_reverse(expand = c(0, 0.05) , limits=c(6.5,0)) + scale_x_discrete(position = "top") + xlab("") + theme_classic() + theme(axis.text.x = element_blank(), panel.background = element_rect(color = "black"))
+egg::ggarrange(a,b, nrow=2, heights=c(3,1))
+
+
+# with significance stars
+stat.test <- melted %>% group_by(celltype) %>% wilcox_test(value~Disease, exact=FALSE) %>% adjust_pvalue(method = "BH") %>% add_significance(p.col="p") %>% add_significance(p.col="p.adj")
+
+# boxplot
+bxp <- ggplot(melted, aes(x=celltype, y=value)) + geom_boxplot(aes(color=Disease), position=position_dodge(0.8), outlier.size = 0.5, width=0.65) + scale_color_manual(values=rev(c("#B2182B", "#2166AC")),  guide = guide_legend(title = "")) + xlab("") + ylab("Estimated proportion") + theme_classic() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1), legend.position=c(0.95,0.9))
+stat.test <- stat.test %>% filter(p.adj.signif != "ns") %>% add_xy_position(x = "celltype", dodge = 0.8)
+stat.test$y.position2 <- c(max(dfEst$ATI) + 0.02, max(dfEst$VE_Capillary_B) + 0.02, max(dfEst$VE_Capillary_A) + 0.02, max(dfEst$SMC) + 0.02, max(dfEst$Pericyte) + 0.02, max(dfEst$Fibroblast) + 0.02, max(dfEst$Myofibroblast) + 0.02, max(dfEst$Mesothelial) + 0.02, max(dfEst$ATII) + 0.02, max(dfEst$Ciliated) + 0.02, max(dfEst$T_Cytotoxic) + 0.02, max(dfEst$Basal) + 0.02, max(dfEst$Club) + 0.02, max(dfEst$Goblet) + 0.02, max(dfEst$Aberrant_Basaloid) + 0.02, max(dfEst$T) + 0.02, max(dfEst$B_Plasma) + 0.02)
+
+
+#png(file="./poster2023/deconprops.png", height=7, width=9, units="in", res=300)
+bxp + stat_pvalue_manual(stat.test, y.position="y.position2", label = "p.adj.signif", tip.length = 0.005, size=2.5)
+#dev.off()
+ggsave("./main_figures/deconvolution.jpg", width=9, height=7, device="jpeg", dpi=350)
+
+```
+
+
+# Test difference of proportions between healthy and IPF
+```{r, warning=FALSE}
+
+wilcoxRes <- NULL
+for(cell in names(dfEst)[1:38]){
+  wilcox <- wilcox.test(dfEst[,cell] ~ dfEst[,"Disease"], data=dfEst)
+  wilcoxRes <- rbind(wilcoxRes, data.frame(cellType=cell, W=wilcox$statistic, pVal=wilcox$p.value))
+}
+
+rownames(wilcoxRes) <- NULL
+hist(wilcoxRes$pVal, breaks=100)
+wilcoxRes$pAdj <- p.adjust(wilcoxRes$pVal, method="BH")
+wilcoxRes[order(wilcoxRes$pAdj),]
+
+none <- wilcoxRes$cellType[is.nan(wilcoxRes$pVal)]
+orderCT <- wilcoxRes$cellType[order(wilcoxRes$pAdj)]
+orderCT <- orderCT[!(orderCT %in% none)]
+
+```
+
+
+# Correlation, all genes (with variable corrections) vs estimated cell proportions
+```{r}
+
+corrRes_CellPropxallGene2 <- NULL
+for(ct in setdiff(celltypes,none)){
+  corr <- apply(bulkNormLog2cpm, 1, cor.test, dfEst[,ct], method="pearson")
+  genes <- names(corr)
+  corrRes_CellPropxallGene2 <- rbind(corrRes_CellPropxallGene2, data.frame(cellType=ct, gene=genes, matrix(unlist(corr), nrow=length(corr), byrow=TRUE)))
+}
+
+corrRes_CellPropxallGene2 <- corrRes_CellPropxallGene2[,c(1:2,6,3,5)]
+colnames(corrRes_CellPropxallGene2)[3:5] <- c("corrCoefficient", "testStatistic", "pVal")
+corrRes_CellPropxallGene2[,3:5] <- lapply(corrRes_CellPropxallGene2[,3:5], as.numeric)
+corrRes_CellPropxallGene2$pAdj <- p.adjust(corrRes_CellPropxallGene2$pVal, method="BH")
+corrRes_CellPropxallGene2$pValDEA <- res_before_adj$P.Value[match(corrRes_CellPropxallGene2$gene, res_before_adj$GeneName)]
+# corrRes_CellPropxallGene2[order(corrRes_CellPropxallGene2$pAdj),]
+corrRes_CellPropxallGene2$updown <- res_before_adj$updown[match(corrRes_CellPropxallGene2$gene, res_before_adj$GeneName)]
+
+for(ct in orderCT){
+  print(ggplot(corrRes_CellPropxallGene2[which(corrRes_CellPropxallGene2$cellType == ct),], aes(x=corrCoefficient, y=-log10(pValDEA))) + geom_point(aes(color=updown), alpha=0.4) + scale_color_manual(name="up/down reg", values=c("blue", "black", "red")) + xlab("correlation coefficient") + ylab("-log10(DEA p-value)") + labs(title=ct) + theme_classic())
+}
+
+```
+
+
+# PCA on estimated cell proportions
+```{r}
+
+cellProps <- dfEst[,which(!(names(dfEst)[1:38] %in% none))]
+cellPCA <- prcomp(cellProps)
+cellPCAResSumm <- data.frame(PC=factor(1:ncol(cellProps)), t(summary(cellPCA)$importance))
+cellPCARes <- cbind(dfEst, data.frame(cellPCA$x))
+cellLoadings <- data.frame(cellPCA$rotation)
+
+a <- ggplot(cellPCAResSumm[1:20,], aes(x=PC, y=Proportion.of.Variance, group=1)) + geom_point() + geom_line() + theme_classic()
+b <- ggplot(cellPCAResSumm[1:20,], aes(x=PC, y=Cumulative.Proportion, group=1)) + geom_point() + geom_line() + theme_classic()
+
+# biplot
+ggplot(cellLoadings, aes(x=PC1, y=PC2, label=rownames(cellLoadings))) + geom_point(cex=1) + geom_text_repel(size=3.5)
+
+options(ggrepel.max.overlaps = 1000)
+#png(file="./poster2023/pca_celltype.png", height=7, width=9, units="in", res=300)
+fviz_pca_biplot(cellPCA, axes=c(1,2), geom.ind="point", col.ind=cellPCARes$Disease, select.var=list(name=c("Ciliated", "Myofibroblast", "Fibroblast", "Macrophage", "VE_Capillary_B", "VE_Capillary_A", "Macrophage_Alveolar", "ATI", "SMC", "pDC", "VE_Peribronchial")), invisible="quali", legend.title="Disease", repel=TRUE) + scale_shape_manual(values=c(19,19)) + scale_color_manual(values=rev(c("#F8766D", "#00BFC4"))) + ggtitle("") + theme_minimal()
+#dev.off()
+#ggsave("./main_figures/PCA_dim12.jpg", width=7, height=5, device="jpeg", dpi=350)
+
+c <- fviz_pca_biplot(cellPCA, axes=c(1,3), geom.ind="point", col.ind=cellPCARes$Disease, select.var=list(name=c("Ciliated", "Myofibroblast", "Fibroblast", "Macrophage", "VE_Capillary_B", "VE_Capillary_A", "Macrophage_Alveolar", "ATI", "SMC", "Pericyte", "pDC", "VE_Peribronchial")), invisible="quali", legend.title="Disease", repel=TRUE) + scale_shape_manual(values=c(19,19)) + scale_color_manual(values=rev(c("#F8766D", "#00BFC4"))) + theme_minimal()
+
+d <- fviz_pca_biplot(cellPCA, axes=c(2,3), geom.ind="point", col.ind=cellPCARes$Disease, select.var=list(name=c("Ciliated", "Myofibroblast", "Fibroblast", "Macrophage", "VE_Capillary_B", "VE_Capillary_A", "Macrophage_Alveolar", "ATI", "SMC", "Pericyte", "pDC", "VE_Peribronchial")), invisible="quali", legend.title="Disease", repel=TRUE) + scale_shape_manual(values=c(19,19)) + scale_color_manual(values=rev(c("#F8766D", "#00BFC4"))) + theme_minimal()
+
+pl <- list(a,b,c,d)
+# for(i in 1:length(pl)){
+#   ggsave(filename = paste("./supp_figures/PCA_",i,".jpg",sep=""), plot = pl[[i]], width=7, height=5, device="jpeg", dpi=350)
+# }
+
+```
+
+
+# Differential expression analysis (adjusting for cell proportions), gene ~ disease + age + gender + tobacco + batch + PC1 cell proportions
+```{r}
+
+bulkFiltered_add <- bulkFiltered
+bulkFiltered_add$samples$PC1 <- cellPCARes[,"PC1"]
+disease <- bulkFiltered_add$samples$group
+age <- bulkFiltered_add$samples$age
+gender <- factor(bulkFiltered_add$samples$gender, levels=c("Female", "Male"))
+tobacco <- factor(bulkFiltered_add$samples$tobacco, levels=c("Never smoked", "Former smoker", "Active smoker"))
+batch <- factor(bulkFiltered_add$samples$batch, levels=c("1", "2"))
+PC1 <- cellPCARes[,"PC1"]
+
+design2 <- model.matrix(~0 + disease + age + gender + tobacco + batch + PC1)
+colnames(design2) <- gsub("disease", "", colnames(design2))
+colnames(design2) <- gsub("tobacco", "", colnames(design2))
+colnames(design2)[5:6] <- c("Former_smoker", "Active_smoker") 
+colnames(design2) <- gsub("gender", "", colnames(design2))
+contrasts2 <- makeContrasts(IPF-Normal, levels = design2)
+contrasts2
+voom2 <- voom(bulkFiltered_add, design2, plot=TRUE)
+
+vfit2 <- lmFit(voom2, design2)
+vfit2 <- contrasts.fit(vfit2, contrasts=contrasts2)
+efit2 <- eBayes(vfit2)
+plotSA(efit2)
+
+
+# Number of DE genes, adjusted p-value cutoff = 0.05
+edt2 <- decideTests(efit2)
+summary(edt2)
+
+upreg <- efit2$genes$GeneName[which(edt2[,1] == 1)]
+downreg <- efit2$genes$GeneName[which(edt2[,1] == -1)] 
+res_afterPC1 <- topTable(efit2, coef=1, n=Inf)
+res_afterPC1
+
+# save de table
+#write.xlsx(res_afterPC1, file="/mnt/dzl_bioinf/calverom/Deconvolution/music_gse134692_lung_transplant/supp_tables/DEtable_after_PC1correction.xlsx", rowNames=FALSE, colNames=TRUE)
+
+DEgenes_afterPC1 <- c(downreg, upreg)
+dfDEgenes_afterPC1 <- res_afterPC1[which(res_afterPC1$GeneName %in% DEgenes_afterPC1),]
+
+# volcano plot
+res_afterPC1$updown <- ifelse(res_afterPC1$GeneName %in% upreg, "up", ifelse(res_afterPC1$GeneName %in% downreg, "down", "notSig"))
+res_afterPC1$symbol <- geneAnno$GeneName[match(res_afterPC1$GeneName, geneAnno$ensembl)]
+
+options(ggrepel.max.overlaps = Inf)
+ggplot(res_afterPC1, aes(x=logFC, y=-log10(P.Value), color=updown, label=symbol)) + geom_point(cex=1) + geom_text_repel(data=res_afterPC1[1:15,], aes(label=symbol), size=3) + scale_color_manual(values=c("#0571b0", "grey", "#ca0020"), guide="none") + theme_classic()
+#ggsave(filename = "./supp_figures/volcano_afterPC1.jpg", width=7, height=5, device="jpeg", dpi=350)
+
+# Pie chart
+freq <- data.frame(summary(edt2))
+freq <- droplevels(freq[freq$Var1 != "NotSig",])
+freq <- freq[order(freq$Var1, decreasing=TRUE),]
+freq$prop <- (freq$Freq / sum(freq$Freq))*100
+freq$ypos <- cumsum(freq$prop)- 0.5*freq$prop 
+ggplot(freq, aes(x="", y=prop, fill=Var1)) + geom_bar(stat="identity", width=1, color="white") + scale_fill_manual(values=c("blue", "red"), labels=c("Down-regulated", "Up-regulated")) + coord_polar("y", start=0) + theme_void() + geom_text(aes(y=ypos, label=Freq), color="white") + labs(fill="")
+
+# DE genes heatmap
+pheatmap(bulkNormLog2cpm[DEgenes_afterPC1,], annotation_col = Anno2, show_rownames=FALSE, show_colnames=FALSE, annotation_names_col=FALSE, scale="row", color = colorRampPalette(rev(brewer.pal(n =7, name = "PuOr")))(50), treeheight_row = 0)
+# remove batch effect
+bb <- bulkNormLog2cpm[DEgenes_afterPC1,]
+rem <- removeBatchEffect(bb, batch=batch)
+#jpeg(filename="./supp_figures/heatmap_afterPC1_DEGs.jpg", width=7.25, height=5, units="in", res=350)
+pheatmap(rem, annotation_col = Anno, show_rownames=FALSE, show_colnames=FALSE, annotation_names_col=FALSE, scale="row", treeheight_row = 0, color = colorRampPalette(rev(brewer.pal(n =7, name = "PuOr")))(50))
+dev.off()
+
+
+```
+
+
+```{r}
+
+# Venn diagram
+ggvenn(list(`with variables correction`=DEgenes_before_adj,  `with PC1 correction`=DEgenes_afterPC1), show_percentage = FALSE, set_name_size = 3, fill_color=c("#56B4E9", "#F0E442"))
+
+```
+
+
+# Enrichr, PC1 correction
+```{r, dpi = 300, dev = "png"}
+
+DEgenes_afterPC1_conv <- geneAnno$GeneName[match(DEgenes_afterPC1, geneAnno$ensembl)] # convert to gene symbols
+path_afterPC1 <- enrichr(DEgenes_afterPC1_conv, dbs)
+
+plotEnrich(path_afterPC1$BioPlanet_2019, showTerms = 10, numChar=60, y = "Ratio", orderBy = "P.value", title="BioPlanet_2019") + scale_x_discrete(labels = function(x) str_wrap(x, width = 30)) + scale_fill_viridis(begin=0.4, option="A") + ggtitle("")
+#ggsave("./main_figures/pathways_afterPC1.jpg", width=7, height=5, device="jpeg", dpi=350)
+
+plotEnrich(path_afterPC1$WikiPathway_2021_Human, showTerms = 10, numChar = 60, y = "Ratio", orderBy = "P.value", title="WikiPathway_2021_Human") + scale_x_discrete(labels = function(x) str_wrap(x, width = 30)) + scale_fill_viridis(begin=0.4, option="A")
+plotEnrich(path_afterPC1$Reactome_2016, showTerms = 10, numChar=60, y = "Ratio", orderBy = "P.value", title="Reactome_2016") + scale_x_discrete(labels = function(x) str_wrap(x, width = 30)) + scale_fill_viridis(begin=0.4, option="A")
+plotEnrich(path_afterPC1$KEGG_2021_Human, showTerms = 10, numChar=60, y = "Ratio", orderBy = "Adjusted.P.value", title="KEGG_2021_Human") + scale_x_discrete(labels = function(x) str_wrap(x, width = 30)) + scale_fill_viridis(begin=0.4, option="A")
+
+# save pathway table
+#write.xlsx(path_afterPC1, file="/mnt/dzl_bioinf/calverom/Deconvolution/music_gse134692_lung_transplant/supp_tables/pathwaytable_after_PC1correction.xlsx", rowNames=FALSE, colNames=TRUE)
+
+```
+
+
+
+# Differential expression analysis (adjusting for cell proportions), gene ~ disease + age + gender + tobacco + PC1 + PC2 + PC3 + PC4 cell proportions
+```{r}
+
+bulkFiltered_add <- bulkFiltered
+bulkFiltered_add$samples$PC1 <- cellPCARes[,"PC1"]
+bulkFiltered_add$samples$PC2 <- cellPCARes[,"PC2"]
+bulkFiltered_add$samples$PC3 <- cellPCARes[,"PC3"]
+bulkFiltered_add$samples$PC4 <- cellPCARes[,"PC4"]
+
+disease <- bulkFiltered_add$samples$group
+age <- bulkFiltered_add$samples$age
+gender <- factor(bulkFiltered_add$samples$gender, levels=c("Female", "Male"))
+tobacco <- factor(bulkFiltered_add$samples$tobacco, levels=c("Never smoked", "Former smoker", "Active smoker"))
+batch <- factor(bulkFiltered_add$samples$batch, levels=c("1", "2"))
+PC1 <- cellPCARes[,"PC1"]
+PC2 <- cellPCARes[,"PC2"]
+PC3 <- cellPCARes[,"PC3"]
+PC4 <- cellPCARes[,"PC4"]
+
+design3 <- model.matrix(~0 + disease + age + gender + tobacco + batch + PC1 + PC2 + PC3 + PC4)
+colnames(design3) <- gsub("disease", "", colnames(design3))
+colnames(design3) <- gsub("tobacco", "", colnames(design3))
+colnames(design3)[5:6] <- c("Former_smoker", "Active_smoker") 
+colnames(design3) <- gsub("gender", "", colnames(design3))
+contrasts3 <- makeContrasts(IPF-Normal, levels = design3)
+contrasts3
+voom3 <- voom(bulkFiltered_add, design3, plot=TRUE)
+
+vfit3 <- lmFit(voom3, design3)
+vfit3 <- contrasts.fit(vfit3, contrasts=contrasts3)
+efit3 <- eBayes(vfit3)
+plotSA(efit3)
+
+
+# Number of DE genes, adjusted p-value cutoff = 0.05
+edt3 <- decideTests(efit3)
+summary(edt3)
+
+upreg <- efit3$genes$GeneName[which(edt3[,1] == 1)]
+downreg <- efit3$genes$GeneName[which(edt3[,1] == -1)] 
+res_afterPC1_PC4 <- topTable(efit3, coef=1, n=Inf)
+res_afterPC1_PC4
+
+# save de table
+#write.xlsx(res_afterPC1_PC4, file="/mnt/dzl_bioinf/calverom/Deconvolution/music_gse134692_lung_transplant/supp_tables/DEtable_after_PC1_PC4correction.xlsx", rowNames=FALSE, colNames=TRUE)
+
+
+DEgenes_afterPC1_PC4 <- c(downreg, upreg)
+dfDEgenes_afterPC1_PC4 <- res_afterPC1_PC4[which(res_afterPC1_PC4$GeneName %in% DEgenes_afterPC1_PC4),]
+
+# volcano plot
+res_afterPC1_PC4$updown <- ifelse(res_afterPC1_PC4$GeneName %in% upreg, "up", ifelse(res_afterPC1_PC4$GeneName %in% downreg, "down", "notSig"))
+res_afterPC1_PC4$symbol <- geneAnno$GeneName[match(res_afterPC1_PC4$GeneName, geneAnno$ensembl)]
+
+options(ggrepel.max.overlaps = Inf)
+#png(file="./poster2023/volc_afterpc1_4.png", height=7, width=9, units="in", res=300)
+ggplot(res_afterPC1_PC4, aes(x=logFC, y=-log10(P.Value), color=updown, label=symbol)) + geom_point(cex=1) + geom_text_repel(data=res_afterPC1_PC4[1:15,], aes(label=symbol), size=3) + scale_color_manual(values=c("#0571b0", "grey", "#ca0020"), guide="none") + theme_classic()
+#dev.off()
+#ggsave(filename="./supp_figures/volcano_afterPC1PC4.jpg", width=7, height=5, dpi=350)
+
+# Pie chart
+freq <- data.frame(summary(edt3))
+freq <- droplevels(freq[freq$Var1 != "NotSig",])
+freq <- freq[order(freq$Var1, decreasing=TRUE),]
+freq$prop <- (freq$Freq / sum(freq$Freq))*100
+freq$ypos <- cumsum(freq$prop)- 0.5*freq$prop 
+ggplot(freq, aes(x="", y=prop, fill=Var1)) + geom_bar(stat="identity", width=1, color="white") + scale_fill_manual(values=c("blue", "red"), labels=c("Down-regulated", "Up-regulated")) + coord_polar("y", start=0) + theme_void() + geom_text(aes(y=ypos, label=Freq), color="white") + labs(fill="")
+
+# DE genes heatmap
+pheatmap(bulkNormLog2cpm[DEgenes_afterPC1_PC4,], annotation_col = Anno2, show_rownames=FALSE, show_colnames=FALSE, annotation_names_col=FALSE, scale="row", color = colorRampPalette(rev(brewer.pal(n =7, name = "PuOr")))(50), treeheight_row = 0)
+# remove batch effect
+bb <- bulkNormLog2cpm[DEgenes_afterPC1_PC4,]
+rem <- removeBatchEffect(bb, batch=batch)
+#jpeg(filename="./supp_figures/heatmap_afterPC1PC4_DEGs.jpg", width=7.25, height=5, units="in", res=350)
+pheatmap(rem, annotation_col = Anno, show_rownames=FALSE, show_colnames=FALSE, annotation_names_col=FALSE, scale="row", treeheight_row = 0, color = colorRampPalette(rev(brewer.pal(n =7, name = "PuOr")))(50))
+dev.off()
+
+```
+
+
+```{r}
+
+# Venn diagram
+ggvenn(list(`with variables correction`=DEgenes_before_adj,  `with PC1-PC4 correction`=DEgenes_afterPC1_PC4), show_percentage = FALSE, set_name_size = 3, fill_color=c("#56B4E9", "#F0E442"))
+
+ggvenn(list(`with variables correction`=DEgenes_before_adj, `with PC1 correction`=DEgenes_afterPC1,  `with PC1-PC4 correction`=DEgenes_afterPC1_PC4), show_percentage = FALSE, set_name_size = 3, fill_color=c("#56B4E9", "#F0E442", "#CC79A7"))
+
+# bar graph
+# num <- data.frame(correction=c("Before cell types correction", "PC1 correction", "PC1-PC4 correction"), count=c(length(DEgenes_before_adj),length(DEgenes_afterPC1),length(DEgenes_afterPC1_PC4)))
+# ggplot(num, aes(x=correction, y=count)) + geom_bar(stat="identity", width=0.5) + theme_classic()
+
+```
+
+
+# Enrichr, PC1-PC4 correction
+```{r, dpi = 300, dev = "png"}
+
+DEgenes_afterPC1_PC4_conv <- geneAnno$GeneName[match(DEgenes_afterPC1_PC4, geneAnno$ensembl)] # convert to gene symbols
+path_afterPC1_PC4 <- enrichr(DEgenes_afterPC1_PC4_conv, dbs)
+
+plotEnrich(path_afterPC1_PC4$BioPlanet_2019, showTerms = 10, numChar=60, y = "Ratio", orderBy = "P.value", title="BioPlanet_2019") + scale_x_discrete(labels = function(x) str_wrap(x, width = 30)) + scale_fill_viridis(begin=0.4, option="A") + ggtitle("")
+#ggsave("./main_figures/pathways_afterPC1PC4.jpg", width=7, height=5, device="jpeg", dpi=350)
+plotEnrich(path_afterPC1_PC4$WikiPathway_2021_Human, showTerms = 10, numChar = 60, y = "Ratio", orderBy = "P.value", title="WikiPathway_2021_Human") + scale_x_discrete(labels = function(x) str_wrap(x, width = 30)) + scale_fill_viridis(begin=0.4, option="A")
+plotEnrich(path_afterPC1_PC4$Reactome_2016, showTerms = 10, numChar=60, y = "Ratio", orderBy = "P.value", title="Reactome_2016") + scale_x_discrete(labels = function(x) str_wrap(x, width = 30)) + scale_fill_viridis(begin=0.4, option="A")
+plotEnrich(path_afterPC1_PC4$KEGG_2021_Human, showTerms = 10, numChar=60, y = "Ratio", orderBy = "Adjusted.P.value", title="KEGG_2021_Human") + scale_x_discrete(labels = function(x) str_wrap(x, width = 30)) + scale_fill_viridis(begin=0.4, option="A")
+
+
+# save pathway table
+#write.xlsx(path_afterPC1_PC4, file="/mnt/dzl_bioinf/calverom/Deconvolution/music_gse134692_lung_transplant/supp_tables/pathwaytable_after_PC1_PC4correction.xlsx", rowNames=FALSE, colNames=TRUE)
+
+```
+
+
+# Correlation, all genes vs estimated cell proportions, PC1 correction
+```{r}
+
+corrRes_CellPropxallGene_afterPC1 <- NULL
+
+for(ct in setdiff(celltypes,none)){
+  corr <- apply(bulkNormLog2cpm, 1, cor.test, dfEst[,ct], method="pearson")
+  genes <- names(corr)
+  corrRes_CellPropxallGene_afterPC1 <- rbind(corrRes_CellPropxallGene_afterPC1, data.frame(cellType=ct, gene=genes, matrix(unlist(corr), nrow=length(corr), byrow=TRUE)))
+}
+
+corrRes_CellPropxallGene_afterPC1 <- corrRes_CellPropxallGene_afterPC1[,c(1:2,6,3,5)]
+colnames(corrRes_CellPropxallGene_afterPC1)[3:5] <- c("corrCoefficient", "testStatistic", "pVal")
+corrRes_CellPropxallGene_afterPC1[,3:5] <- lapply(corrRes_CellPropxallGene_afterPC1[,3:5], as.numeric)
+corrRes_CellPropxallGene_afterPC1$pAdj <- p.adjust(corrRes_CellPropxallGene_afterPC1$pVal, method="BH")
+corrRes_CellPropxallGene_afterPC1$pValDEA <- res_afterPC1$P.Value[match(corrRes_CellPropxallGene_afterPC1$gene, res_afterPC1$GeneName)]
+# corrRes_CellPropxallGene_afterPC1[order(corrRes_CellPropxallGene_afterPC1$pAdj),]
+corrRes_CellPropxallGene_afterPC1$updown <- res_afterPC1$updown[match(corrRes_CellPropxallGene_afterPC1$gene, res_afterPC1$GeneName)]
+# save corr table
+#write.xlsx(corrRes_CellPropxallGene_afterPC1, "/mnt/dzl_bioinf/calverom/Deconvolution/music_gse134692_lung_transplant/supp_tables/correlation_celltype_genes_afterPC1_correction.xlsx", colNames=TRUE, rowNames=FALSE)
+
+for(ct in orderCT){
+  print(ggplot(corrRes_CellPropxallGene_afterPC1[which(corrRes_CellPropxallGene_afterPC1$cellType == ct),], aes(x=corrCoefficient, y=-log10(pValDEA))) + geom_point(aes(color=updown), alpha=0.4) + scale_color_manual(name="up/down reg", values=c("blue", "black", "red")) + xlab("correlation coefficient") + ylab("-log10(DEA p-value)") + annotate("text", x=-Inf, y=Inf, label=ct, hjust=-0.1, vjust=1, size=5) + theme_classic() + theme(legend.position="top"))
+  #pathh <- paste("./main_figures/ears_PC1/ears_afterPC1", "_", ct, ".jpg", sep="")
+  #ggsave(filename=pathh, width=7, height=5, device="jpeg", dpi=350)
+}
+
+```
+
+## EnrichR, cell type-specific pathways in bulk, PC1 correction
+```{r}
+
+# For EnrichR
+
+# subset with correlation coefficient > 0.5
+corrRes_afterPC1_sub <- corrRes_CellPropxallGene_afterPC1[corrRes_CellPropxallGene_afterPC1$corrCoefficient >= 0.5,]
+corrRes_afterPC1_sub <- corrRes_afterPC1_sub[,-c(6,8)]
+#corrRes_afterPC1_sub$gene2 <- geneAnno$GeneName[match(corrRes_afterPC1_sub$gene, geneAnno$ensembl)]
+corrGenes <- unique(corrRes_afterPC1_sub$gene)
+#corrGenes_conv <- geneAnno$GeneName[match(corrGenes, geneAnno$ensembl)]
+
+# subset DE results with only genes from above^
+res_afterPC1_sub <- res_afterPC1[res_afterPC1$GeneName %in% corrGenes,]
+res_afterPC1_sub <- res_afterPC1_sub[,1:ncol(res_afterPC1_sub)-1]
+# recompute adj.P.Val
+res_afterPC1_sub$adj.P.Val <- p.adjust(res_afterPC1_sub$P.Value, method="BH")
+
+# add p-values and adjusted p-values from above^ to corrRes_afterPC1_sub
+corrRes_afterPC1_sub$pValDEA <- res_afterPC1_sub$P.Value[match(corrRes_afterPC1_sub$gene, res_afterPC1_sub$GeneName)]
+corrRes_afterPC1_sub$pAdjDEA <- res_afterPC1_sub$adj.P.Val[match(corrRes_afterPC1_sub$gene, res_afterPC1_sub$GeneName)]
+
+corrRes_afterPC1_sub$sig0.05 <- ifelse(corrRes_afterPC1_sub$pAdjDEA <= 0.05, "sig", "not sig")
+corrRes_afterPC1_sub$sig0.1 <- ifelse(corrRes_afterPC1_sub$pAdjDEA <= 0.1, "sig", "not sig")
+# count DE genes (alpha = 0.05) per cell type
+s0.05 <- as.data.frame(table(corrRes_afterPC1_sub$cellType, corrRes_afterPC1_sub$sig0.05))
+# count DE genes (alpha=0.1) per cell type
+s0.1 <- as.data.frame(table(corrRes_afterPC1_sub$cellType, corrRes_afterPC1_sub$sig0.1))
+
+# write.xlsx(corrRes_afterPC1_sub, "/mnt/dzl_bioinf/calverom/Deconvolution/music_gse134692_lung_transplant/supp_tables/corr_CTxsubGenes_afterPC1_correction.xlsx")
+
+ggplot(s0.05[s0.05$Var2 == "sig",], aes(x=Var1, y=Freq, fill=Var2)) + geom_bar(stat="identity", position="dodge") + xlab("") + ylab("number of genes (for Enrichr)") + theme_classic() + coord_flip() + theme(legend.position="none")
+
+```
+
+```{r, out.extra='style="max-width:none; width:80vw; margin-left:calc(50% - 40vw);"', fig.width = 17, fig.height=10}
+
+path_afterPC1_celltype_specific <- NULL
+for(ct in orderCT){
+  temp <- droplevels(corrRes_afterPC1_sub[corrRes_afterPC1_sub$cellType == ct, ])
+  genes <- temp$gene[temp$sig0.05 == "sig"]
+  if(length(genes) >= 10){
+    genes_conv <- geneAnno$GeneName[match(genes, geneAnno$ensembl)]
+    enr <- enrichr(genes_conv, dbs)
+    path_afterPC1_celltype_specific[[ct]] <- enr
+    p1 <- plotEnrich(path_afterPC1_celltype_specific[[ct]]$BioPlanet_2019, showTerms = 10, numChar=60, y = "Ratio", orderBy = "P.value", title="BioPlanet_2019") + scale_x_discrete(labels = function(x) str_wrap(x, width = 30)) + scale_fill_viridis(begin=0.4, option="A") + ggtitle("")
+    #pathh <- paste("./main_figures/pathways_celltype_PC1/path_afterPC1", "_", ct, ".jpg", sep="")
+    #ggsave(filename=pathh, plot=p1, width=7, height=5, device="jpeg", dpi=350)
+  
+    p2 <- plotEnrich(path_afterPC1_celltype_specific[[ct]]$WikiPathway_2021_Human, showTerms = 10, numChar=60, y = "Ratio", orderBy = "P.value", title="WikiPathway_2021_Human") + scale_x_discrete(labels = function(x) str_wrap(x, width = 30)) + scale_fill_viridis(begin=0.4, option="A")
+    p3 <- plotEnrich(path_afterPC1_celltype_specific[[ct]]$Reactome_2016, showTerms = 10, numChar=60, y = "Ratio", orderBy = "P.value", title="Reactome_2016") + scale_x_discrete(labels = function(x) str_wrap(x, width = 30)) + scale_fill_viridis(begin=0.4, option="A")
+    title <- ggdraw() + draw_label(ct, x=0, hjust=0, size=12) + theme(plot.margin = margin(0, 0, 0, 7))
+    pl <- plot_grid(p1,p2,p3, ncol=2)
+    print(plot_grid(title,pl, ncol=1,rel_heights=c(0.1, 1)))
+  }
+}
+
+
+# write, pathway results per cell type
+# write.xlsx(setNames(as.list(lapply(path_afterPC1_celltype_specific, data.frame)), names(path_afterPC1_celltype_specific)), "/mnt/dzl_bioinf/calverom/Deconvolution/music_gse134692_lung_transplant/supp_tables/pathwaytable_celltypespecific_after_PC1correction.xlsx", colNames=TRUE, rowNames=FALSE)
+#write_rds(path_afterPC1_celltype_specific, "/mnt/dzl_bioinf/calverom/Deconvolution/music_gse134692_lung_transplant/CTpathways_PC1corrected.rds")
+#write_rds(path_afterPC1_celltype_specific, "/mnt/dzl_bioinf/calverom/Deconvolution/music_gse134692_lung_transplant/supp_tables/CTpathways_PC1corrected.rds")
+
+
+```
+
+
+
+# Correlation, all genes vs estimated cell proportions, PC1-PC4 correction
+```{r}
+
+corrRes_CellPropxallGene_afterPC1_PC4 <- NULL
+
+for(ct in setdiff(celltypes,none)){
+  corr <- apply(bulkNormLog2cpm, 1, cor.test, dfEst[,ct], method="pearson")
+  genes <- names(corr)
+  corrRes_CellPropxallGene_afterPC1_PC4 <- rbind(corrRes_CellPropxallGene_afterPC1_PC4, data.frame(cellType=ct, gene=genes, matrix(unlist(corr), nrow=length(corr), byrow=TRUE)))
+}
+
+corrRes_CellPropxallGene_afterPC1_PC4 <- corrRes_CellPropxallGene_afterPC1_PC4[,c(1:2,6,3,5)]
+colnames(corrRes_CellPropxallGene_afterPC1_PC4)[3:5] <- c("corrCoefficient", "testStatistic", "pVal")
+corrRes_CellPropxallGene_afterPC1_PC4[,3:5] <- lapply(corrRes_CellPropxallGene_afterPC1_PC4[,3:5], as.numeric)
+corrRes_CellPropxallGene_afterPC1_PC4$pAdj <- p.adjust(corrRes_CellPropxallGene_afterPC1_PC4$pVal, method="BH")
+corrRes_CellPropxallGene_afterPC1_PC4$pValDEA <- res_afterPC1_PC4$P.Value[match(corrRes_CellPropxallGene_afterPC1_PC4$gene, res_afterPC1_PC4$GeneName)]
+# corrRes_CellPropxallGene_afterPC1_PC4[order(corrRes_CellPropxallGene_afterPC1_PC4$pAdj),]
+corrRes_CellPropxallGene_afterPC1_PC4$updown <- res_afterPC1_PC4$updown[match(corrRes_CellPropxallGene_afterPC1_PC4$gene, res_afterPC1_PC4$GeneName)]
+
+# save corr table
+#write.xlsx(corrRes_CellPropxallGene_afterPC1_PC4, "/mnt/dzl_bioinf/calverom/Deconvolution/music_gse134692_lung_transplant/supp_tables/correlation_celltype_genes_afterPC1_PC4_correction.xlsx", colNames=TRUE, rowNames=FALSE)
+
+for(ct in orderCT){
+  print(ggplot(corrRes_CellPropxallGene_afterPC1_PC4[which(corrRes_CellPropxallGene_afterPC1_PC4$cellType == ct),], aes(x=corrCoefficient, y=-log10(pValDEA))) + geom_point(aes(color=updown), alpha=0.4) + scale_color_manual(name="up/down reg", values=c("blue", "black", "red")) + xlab("correlation coefficient") + ylab("-log10(DEA p-value)") + annotate("text", x=-Inf, y=Inf, label=ct, hjust=-0.1, vjust=1, size=5) + theme_classic() + theme(legend.position="top"))
+  #pathh <- paste("./main_figures/ears_PC1PC4/ears_afterPC1PC4", "_", ct, ".jpg", sep="")
+  #ggsave(filename=pathh, width=7, height=5, device="jpeg", dpi=350)
+}
+
+```
+
+## EnrichR, cell type-specific pathways in bulk, PC1-PC4 correction
+```{r}
+
+# For EnrichR
+
+# subset with correlation coefficient > 0.5
+corrRes_afterPC1_PC4_sub <- corrRes_CellPropxallGene_afterPC1_PC4[corrRes_CellPropxallGene_afterPC1_PC4$corrCoefficient >= 0.5,]
+corrRes_afterPC1_PC4_sub <- corrRes_afterPC1_PC4_sub[,-c(6,8)]
+#corrRes_afterPC1_PC4_sub$gene2 <- geneAnno$GeneName[match(corrRes_afterPC1_PC4_sub$gene, geneAnno$ensembl)]
+corrGenes <- unique(corrRes_afterPC1_PC4_sub$gene)
+#corrGenes_conv <- geneAnno$GeneName[match(corrGenes, geneAnno$ensembl)]
+
+# subset DE results with only genes from above^
+res_afterPC1_PC4_sub <- res_afterPC1_PC4[res_afterPC1_PC4$GeneName %in% corrGenes,]
+res_afterPC1_PC4_sub <- res_afterPC1_PC4_sub[,1:ncol(res_afterPC1_PC4_sub)-1]
+# recompute adj.P.Val
+res_afterPC1_PC4_sub$adj.P.Val <- p.adjust(res_afterPC1_PC4_sub$P.Value, method="BH")
+
+# add p-values and adjusted p-values from above^ to corrRes_afterPC1_PC4_sub
+corrRes_afterPC1_PC4_sub$pValDEA <- res_afterPC1_PC4_sub$P.Value[match(corrRes_afterPC1_PC4_sub$gene, res_afterPC1_PC4_sub$GeneName)]
+corrRes_afterPC1_PC4_sub$pAdjDEA <- res_afterPC1_PC4_sub$adj.P.Val[match(corrRes_afterPC1_PC4_sub$gene, res_afterPC1_PC4_sub$GeneName)]
+
+corrRes_afterPC1_PC4_sub$sig0.05 <- ifelse(corrRes_afterPC1_PC4_sub$pAdjDEA <= 0.05, "sig", "not sig")
+corrRes_afterPC1_PC4_sub$sig0.1 <- ifelse(corrRes_afterPC1_PC4_sub$pAdjDEA <= 0.1, "sig", "not sig")
+# count DE genes (alpha = 0.05) per cell type
+s0.05 <- as.data.frame(table(corrRes_afterPC1_PC4_sub$cellType, corrRes_afterPC1_PC4_sub$sig0.05))
+# count DE genes (alpha=0.1) per cell type
+s0.1 <- as.data.frame(table(corrRes_afterPC1_PC4_sub$cellType, corrRes_afterPC1_PC4_sub$sig0.1))
+
+# write.xlsx(corrRes_afterPC1_PC4_sub, "./results tree 22.4.25/afterPC1_PC4_correction_corr_CTxsubGenes.xlsx")
+
+ggplot(s0.05[s0.05$Var2 == "sig",], aes(x=Var1, y=Freq, fill=Var2)) + geom_bar(stat="identity", position="dodge") + xlab("") + ylab("number of genes (for Enrichr)") + theme_classic() + coord_flip() + theme(legend.position="none")
+
+```
+
+```{r, out.extra='style="max-width:none; width:80vw; margin-left:calc(50% - 40vw);"', fig.width = 17, fig.height=10}
+
+path_afterPC1_PC4_celltype_specific <- NULL
+for(ct in orderCT){
+  temp <- droplevels(corrRes_afterPC1_PC4_sub[corrRes_afterPC1_PC4_sub$cellType == ct, ])
+  genes <- temp$gene[temp$sig0.05 == "sig"]
+  if(length(genes) >= 10){
+    genes_conv <- geneAnno$GeneName[match(genes, geneAnno$ensembl)]
+    enr <- enrichr(genes_conv, dbs)
+    path_afterPC1_PC4_celltype_specific[[ct]] <- enr
+    p1 <- plotEnrich(path_afterPC1_PC4_celltype_specific[[ct]]$BioPlanet_2019, showTerms = 10, numChar=60, y = "Ratio", orderBy = "P.value", title="BioPlanet_2019") + scale_x_discrete(labels = function(x) str_wrap(x, width = 30)) + scale_fill_viridis(begin=0.4, option="A") + ggtitle("")
+    #pathh <- paste("./main_figures/pathways_celltype_PC1PC4/path_afterPC1PC4", "_", ct, ".jpg", sep="")
+    #ggsave(filename=pathh, plot=p1, width=7, height=5, device="jpeg", dpi=350)
+    
+    p2 <- plotEnrich(path_afterPC1_PC4_celltype_specific[[ct]]$WikiPathway_2021_Human, showTerms = 10, numChar=60, y = "Ratio", orderBy = "P.value", title="WikiPathway_2021_Human") + scale_x_discrete(labels = function(x) str_wrap(x, width = 30)) + scale_fill_viridis(begin=0.4, option="A")
+    p3 <- plotEnrich(path_afterPC1_PC4_celltype_specific[[ct]]$Reactome_2016, showTerms = 10, numChar=60, y = "Ratio", orderBy = "P.value", title="Reactome_2016") + scale_x_discrete(labels = function(x) str_wrap(x, width = 30)) + scale_fill_viridis(begin=0.4, option="A")
+    title <- ggdraw() + draw_label(ct, x=0, hjust=0, size=12) + theme(plot.margin = margin(0, 0, 0, 7))
+    pl <- plot_grid(p1,p2,p3, ncol=2)
+    print(plot_grid(title,pl, ncol=1,rel_heights=c(0.1, 1)))
+  }
+}
+
+
+# write to excel, pathway results per cell type
+#write_rds(path_afterPC1_PC4_celltype_specific, "/mnt/dzl_bioinf/calverom/Deconvolution/music_gse134692_lung_transplant/CTpathways_PC1_PC4corrected.rds")
+#write_rds(path_afterPC1_PC4_celltype_specific, "/mnt/dzl_bioinf/calverom/Deconvolution/music_gse134692_lung_transplant/supp_tables/CTpathways_PC1_PC4corrected.rds")
+
+```

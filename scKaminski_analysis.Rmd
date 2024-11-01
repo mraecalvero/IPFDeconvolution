@@ -1,0 +1,127 @@
+---
+title: "Analyzing Kaminski dataset"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+
+
+```{r, echo=F}
+
+library(Seurat)
+library(tidyverse)
+
+
+scKaminski <- readRDS("/mnt/dzl_bioinf/calverom/Deconvolution/Data/Lung_Kaminski_processed_subset_downsampled.rds")
+
+
+```
+
+# Differential expression analysis between control and IPF per cell type
+```{r}
+
+Idents(scKaminski) <- factor(scKaminski$CellType)
+scKaminski$celltype.condition <- paste(Idents(scKaminski), scKaminski$Disease, sep="_")
+Idents(scKaminski) <- "celltype.condition"
+
+table(scKaminski$CellType, scKaminski$Disease)
+
+
+excl <- c("cDC1", "Mast", "pDC", "DC_Mature", "DC_Langerhans", "Club", "Mesothelial", "Aberrant_Basaloid", "Ionocyte", "PNEC", "NK", "B_Plasma", "ILC_A", "B", "T", "T_Regulatory", "T_Cytotoxic", "ILC_B") # cell types w/ estimated props = 0 for all samples in MuSiC tree deconvolution
+celltypes <- setdiff(unique(scKaminski$CellType), excl)
+Idents(scKaminski) <- "celltype.condition"
+markers.list <- list()
+for(ct in celltypes){
+  try({
+    ident.1 <- paste(ct, "_IPF", sep="")
+    ident.2 <- paste(ct, "_Control", sep="")
+    markers <- FindMarkers(scKaminski, ident.1 = ident.1, ident.2 = ident.2, test.use="negbinom", verbose = FALSE)
+    markers.list[[ct]] <- markers
+  })
+}
+
+# saveRDS(markers.list, "/mnt/dzl_bioinf/calverom/Deconvolution/music_ltrc/dea_kaminski_per_celltype.rds")
+
+
+
+excl2 <- c("cDC2", "cDC1", "Mast", "pDC", "DC_Mature", "Mesothelial", "B", "T", "ILC_B", "PNEC", "Aberrant_Basaloid", "Ionocyte") # cell types w/ estimated props = 0 for all samples in normal MuSiC deconvolution + no control samples
+celltypes2 <- setdiff(unique(scKaminski$CellType), excl2)
+Idents(scKaminski) <- "celltype.condition"
+markers.list2 <- list()
+for(ct in celltypes){
+  try({
+    ident.1 <- paste(ct, "_IPF", sep="")
+    ident.2 <- paste(ct, "_Control", sep="")
+    markers <- FindMarkers(scKaminski, ident.1 = ident.1, ident.2 = ident.2, test.use="negbinom", verbose = FALSE)
+    markers.list2[[ct]] <- markers
+  })
+}
+
+saveRDS(markers.list2, "/mnt/dzl_bioinf/calverom/Deconvolution/music_ltrc/dea_kaminski_per_celltype2.rds")
+
+```
+
+```{r}
+
+par(mfrow=c(2,3))
+for(ct in names(markers.list)[1:5]){
+  hist(markers.list[[ct]]$p_val, main=paste(ct, "p-values"), breaks=20)
+}
+
+par(mfrow=c(2,3))
+for(ct in names(markers.list)[6:10]){
+  hist(markers.list[[ct]]$p_val, main=paste(ct, "p-values"), breaks=20)
+}
+
+par(mfrow=c(2,3))
+for(ct in names(markers.list)[11:15]){
+  hist(markers.list[[ct]]$p_val, main=paste(ct, "p-values"), breaks=20)
+}
+
+par(mfrow=c(2,3))
+for(ct in names(markers.list)[16:20]){
+  hist(markers.list[[ct]]$p_val, main=paste(ct, "p-values"), breaks=20)
+}
+
+```
+
+
+# Average expression by cell type
+```{r}
+
+counts <- GetAssayData(object=scKaminski, slot="counts")
+nonzero <- counts > 0 # Output a logical vector for every gene on whether there are more than zero counts per cell
+genes_expr <- Matrix::rowSums(nonzero) > 0 # Sums all TRUE values and returns TRUE if at least 1 TRUE value per gene
+table(genes_expr) # 590 genes are not at all expressed, 38384 expressed
+keep_genes <- names(genes_expr)[which(genes_expr == TRUE)] # 38384 genes
+
+Idents(scKaminski) <- scKaminski$CellType
+ave_counts <- log1p(data.frame(AverageExpression(scKaminski, slot="counts", features=keep_genes)$RNA, check.names=FALSE))
+write_rds(ave_counts, "/mnt/dzl_bioinf/calverom/Deconvolution/music_ltrc/ave_by_celltype_counts.rds")
+
+
+```
+
+
+# Find markers per cell cluster (high level), from using top 9 PCs
+```{r, eval=F}
+
+scKaminski <- readRDS("/mnt/dzl_bioinf/calverom/Deconvolution/Data/Lung_Kaminski_processed_subset_downsampled_new.rds")
+
+clusters <- c("Lymphatic", "VE_Venous", "VE_Arterial", "cMonocyte", "ncMonocyte", "Fibroblast", "Myofibroblast", "Basal", "Club", "Goblet", "Aberrant_Basaloid", "cDC2", "DC_Langerhans", "NK", "ILC_A", "T", "T_Cytotoxic", "ILC_B", "Mast", "ATI", "VE_Capillary_A", "VE_Capillary_B", "Macrophage_Alveolar", "Macrophage", "B_Plasma", "B", "T_Regulatory", "Mesothelial", "Ciliated", "ATII", "cDC1", "DC_Mature", "pDC", "SMC", "Pericyte", "VE_Peribronchial",  "Ionocyte", "PNEC")
+names(clusters) <- c(rep("C1", 3), rep("C2", 2), rep("C3", 2), rep("C4", 4), rep("C5", 2), rep("C6", 6), "C7", rep("C8", 2), rep("C9", 2), "C10", rep("C11",2), "C12", "C13", "C14", rep("C15", 2), "C16", rep("C17",2), "C18", "C19", "C20")
+
+scKaminski$new_clusters <- as.character(names(clusters)[match(scKaminski$CellType, clusters)])
+
+Idents(scKaminski) <- scKaminski$new_clusters
+markers_new_clusters <- FindAllMarkers(scKaminski, test.use="negbinom") # 38384 genes
+write_rds(markers_new_clusters, "/mnt/dzl_bioinf/calverom/Deconvolution/music_ltrc/markers_by_newestclusters_Kaminski.rds")
+
+
+# Remove these 590 genes from scKaminski
+scKaminski_sub <- subset(scKaminski, features=keep_genes)
+write_rds(scKaminski_sub, "/mnt/dzl_bioinf/calverom/Deconvolution/Data/Lung_Kaminski_processed_subset_downsampled_new.rds")
+
+
+```

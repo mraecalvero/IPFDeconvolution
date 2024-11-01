@@ -1,0 +1,234 @@
+---
+title: "Validation of cell type specific pathways with Kropski scdata"
+output: 
+  html_notebook:
+    toc: yes
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    number_sections: true
+    df_print: paged
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r, include=F, message=F}
+
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(qvalue)
+library(enrichR)
+library(tidyverse)
+library(viridis)
+library(ggrepel)
+library(openxlsx)
+
+knitr::opts_chunk$set(warning=FALSE, message=FALSE)
+options(ggrepel.max.overlaps = Inf)
+
+```
+
+
+```{r, echo=FALSE}
+
+# single cell data
+scKropski <- readRDS("/mnt/dzl_bioinf/calverom/Deconvolution/Data/Lung_Kropski_processed_subset.rds")
+
+# cell type specific pathway results from GSE134692 & GSE150910
+CTpath_gse134692_PC1 <- readRDS("/mnt/dzl_bioinf/calverom/Deconvolution/music_gse134692_lung_transplant/CTpathways_PC1corrected.rds")
+CTpath_gse134692_PC1_PC4 <- readRDS("/mnt/dzl_bioinf/calverom/Deconvolution/music_gse134692_lung_transplant/CTpathways_PC1_PC4corrected.rds")
+CTpath_gse150910_PC1 <- readRDS("/mnt/dzl_bioinf/calverom/Deconvolution/music_gse150910/CTpathways_PC1corrected.rds")
+CTpath_gse150910_PC1_PC4 <- readRDS("/mnt/dzl_bioinf/calverom/Deconvolution/music_gse150910/CTpathways_PC1_PC4corrected.rds")
+
+
+# pathways & gene lists BioPlanet2019
+bioplanet <- read.csv2("/mnt/dzl_bioinf/calverom/Deconvolution/Data/bioplanet_pathways.csv", header=TRUE)
+
+```
+
+
+# Get DE markers (healthy vs IPF) per cell type
+```{r, eval=FALSE}
+
+Idents(scKropski) <- factor(scKropski$celltype)
+scKropski$celltype.condition <- paste(Idents(scKropski), scKropski$Diagnosis, sep="_")
+Idents(scKropski) <- "celltype.condition"
+
+#table(scKropski$celltype, scKropski$Diagnosis)
+
+
+Idents(scKropski) <- "celltype.condition"
+markers_res <- NULL
+for(ct in unique(scKropski$celltype)){
+  try({
+    ident.1 <- paste(ct, "_IPF", sep="")
+    ident.2 <- paste(ct, "_Control", sep="")
+    markers <- FindMarkers(scKropski, ident.1 = ident.1, ident.2 = ident.2, test.use="negbinom", verbose = FALSE)
+    markers_res <- rbind(markers_res, data.frame(markers, celltype=ct))
+  })
+}
+
+markers_res$gene <- rownames(markers_res)
+
+#saveRDS(markers_res, "/mnt/dzl_bioinf/calverom/Deconvolution/validation_Kropski/celltype_DEmarkers.rds")
+
+
+```
+
+```{r}
+
+markers <- readRDS("/mnt/dzl_bioinf/calverom/Deconvolution/validation_Kropski/celltype_DEmarkers.rds")
+#write.xlsx(markers, "/mnt/dzl_bioinf/calverom/Deconvolution/validation_Kropski/supp_tables/markers.xlsx", rowNames=TRUE, colNames=TRUE)
+
+# rename some sc Krospki celltype names to match Kaminski
+old <- c("AT2", "Macrophages", "NK Cells", "AT1", "Plasma Cells", "Fibroblasts", "Myofibroblasts", "Smooth Muscle Cells", "Mesothelial Cells", "pDCs")
+new <- c("ATII", "Macrophage", "NK", "ATI", "B_Plasma", "Fibroblast", "Myofibroblast", "SMC", "Mesothelial", "pDC")
+renames <- data.frame(old=old, new=new)
+
+markers$celltype <- ifelse(markers$celltype %in% renames$old, renames$new[match(markers$celltype,renames$old)], markers$celltype)
+sc_celltypes <- unique(markers$celltype)
+
+
+# label genes "significant/not significant"
+markers$sig_or_not <- ifelse(markers$p_val_adj <= 0.05, "significant", "not significant")
+markers$sig_or_not <- factor(markers$sig_or_not, levels=c("significant", "not significant"))
+
+```
+
+
+# Pathway analysis per cell type
+Perform pathway analysis per cell type and compare with the results from bulk cell type specific pathways after correction
+```{r}
+
+sc_pathRes <- NULL
+setEnrichrSite("Enrichr")
+websiteLive <- TRUE
+db <- "BioPlanet_2019"
+for(ct in sc_celltypes){
+  temp <- droplevels(markers[markers$celltype == ct,])
+  genes <- temp$gene[temp$sig_or_not == "significant"]
+  enr <- enrichr(genes, db)
+  sc_pathRes[[ct]] <- enr
+  # if(dim(enr$BioPlanet_2019)[1] > 0){
+  #   print(plotEnrich(enr$BioPlanet_2019, showTerms=10, numChar=60, y = "Ratio", orderBy = "P.value", title=paste(ct, "BioPlanet_2019", sep=" ")) + scale_x_discrete(labels = function(x) str_wrap(x, width = 30)) + scale_fill_viridis(begin=0.4, option="A"))
+  # }
+}
+
+# save
+#write_rds(sc_pathRes, "/mnt/dzl_bioinf/calverom/Deconvolution/validation_Kropski/scKropski_CTpathways.rds")
+#write.xlsx(sc_pathRes, "/mnt/dzl_bioinf/calverom/Deconvolution/validation_Kropski/supp_tables/pathwaytable_per_celltype.xlsx", colNames=TRUE, rowNames=FALSE)
+
+
+```
+
+# Merge main and sc pathway results for selected pathways
+```{r}
+
+pathways <- c("Extracellular matrix organization", "Wnt signaling pathway and pluripotency", "Wnt signaling pathway", "TGF-beta signaling pathway", "TGF-beta regulation of extracellular matrix", "TGF-beta signaling in development")
+
+#### GSE134692, PC1 correction ####
+common_celltypes <- intersect(sc_celltypes, names(CTpath_gse134692_PC1))
+dat1 <- NULL
+for(ct in common_celltypes){
+  main <- CTpath_gse134692_PC1[[ct]]$BioPlanet_2019[which(CTpath_gse134692_PC1[[ct]]$BioPlanet_2019$Term %in% pathways), c("Term", "P.value")]
+  sc <- sc_pathRes[[ct]]$BioPlanet_2019[which(sc_pathRes[[ct]]$BioPlanet_2019$Term %in% pathways), c("Term", "P.value")]
+  names(sc) <- c("Term2", "P.value2")
+  if(dim(main)[1] != 0 && dim(sc)[1] != 0){
+    temp <- merge(main,sc, by.x="Term", by.y="Term2", all=TRUE)
+    temp <- cbind(celltype=ct, temp)
+    dat1 <- rbind(dat1, temp)
+    #print(ggplot(temp, aes(x=P.value2, y=P.value, label=Term)) + geom_point() + geom_text_repel(size=3) + xlab("pvalue from sc") + ylab("pvalue from after decon") + ggtitle(ct))
+  }
+}
+
+
+#### GSE134692, PC1-PC4 correction ####
+common_celltypes <- intersect(sc_celltypes, names(CTpath_gse134692_PC1_PC4))
+dat2 <- NULL
+for(ct in common_celltypes){
+  main <- CTpath_gse134692_PC1_PC4[[ct]]$BioPlanet_2019[CTpath_gse134692_PC1_PC4[[ct]]$BioPlanet_2019$Term %in% pathways, c("Term", "P.value")]
+  sc <- sc_pathRes[[ct]]$BioPlanet_2019[sc_pathRes[[ct]]$BioPlanet_2019$Term %in% pathways, c("Term", "P.value")]
+  names(sc) <- c("Term2", "P.value2")
+  if(dim(main)[1] != 0 && dim(sc)[1] != 0){
+    temp <- merge(main,sc, by.x="Term", by.y="Term2", all=TRUE)
+    temp <- cbind(celltype=ct, temp)
+    dat2 <- rbind(dat2, temp)
+    #print(ggplot(temp, aes(x=P.value2, y=P.value, label=Term)) + geom_point() + geom_text_repel(size=3) + xlab("pvalue from sc") + ylab("pvalue from after decon") + ggtitle(ct))
+  }
+}
+
+
+#### GSE150910, PC1 correction ####
+common_celltypes <- intersect(sc_celltypes, names(CTpath_gse150910_PC1))
+dat3 <- NULL
+for(ct in common_celltypes){
+  main <- CTpath_gse150910_PC1[[ct]]$BioPlanet_2019[CTpath_gse150910_PC1[[ct]]$BioPlanet_2019$Term %in% pathways, c("Term", "P.value")]
+  sc <- sc_pathRes[[ct]]$BioPlanet_2019[sc_pathRes[[ct]]$BioPlanet_2019$Term %in% pathways, c("Term", "P.value")]
+  names(sc) <- c("Term2", "P.value2")
+  if(dim(main)[1] != 0 && dim(sc)[1] != 0){
+    temp <- merge(main,sc, by.x="Term", by.y="Term2", all=TRUE)
+    temp <- cbind(celltype=ct, temp)
+    dat3 <- rbind(dat3, temp)
+    #print(ggplot(temp, aes(x=P.value2, y=P.value, label=Term)) + geom_point() + geom_text_repel(size=3) + xlab("pvalue from sc") + ylab("pvalue from after decon") + ggtitle(ct))
+  }
+}
+
+
+#### GSE150910, PC1-PC4 correction ####
+common_celltypes <- intersect(sc_celltypes, names(CTpath_gse150910_PC1_PC4))
+dat4 <- NULL
+for(ct in common_celltypes){
+  main <- CTpath_gse150910_PC1_PC4[[ct]]$BioPlanet_2019[CTpath_gse150910_PC1_PC4[[ct]]$BioPlanet_2019$Term %in% pathways, c("Term", "P.value")]
+  sc <- sc_pathRes[[ct]]$BioPlanet_2019[sc_pathRes[[ct]]$BioPlanet_2019$Term %in% pathways, c("Term", "P.value")]
+  names(sc) <- c("Term2", "P.value2")
+  #cat(ct, dim(main), dim(sc))
+  if(dim(main)[1] != 0 && dim(sc)[1] != 0){
+    temp <- merge(main,sc, by.x="Term", by.y="Term2", all=TRUE)
+    temp <- cbind(celltype=ct, temp)
+    dat4 <- rbind(dat4, temp)
+    #print(ggplot(temp, aes(x=P.value2, y=P.value, label=Term)) + geom_point() + geom_text_repel(size=3) + xlab("pvalue from sc") + ylab("pvalue from after decon") + ggtitle(ct))
+  }
+}
+
+lstt <- list(GSE134692_PC1correction=dat1, GSE134692_PC1_PC4correction=dat2, GSE150910_PC1correction=dat3, GSE150910_PC1_PC4correction=dat4)
+#write.xlsx(lstt, "/mnt/dzl_bioinf/calverom/Deconvolution/validation_Kropski/supp_tables/bulk_singlecell_pathways.xlsx", rowNames=FALSE, colNames=TRUE)
+
+```
+
+
+# Validation plots
+```{r}
+
+# pathways <- c("Extracellular matrix organization", "Wnt signaling pathway and pluripotency", "Wnt signaling pathway", "TGF-beta signaling pathway", "TGF-beta regulation of extracellular matrix", "TGF-beta signaling in development")
+
+#### GSE134692, PC1 correction ####
+a <- ggplot(dat1, aes(x=-log10(P.value2), y=-log10(P.value), label=celltype, color=Term)) + geom_point() + geom_text_repel(size=3) + scale_color_discrete(labels=function(x) str_wrap(x, width = 35), name="pathway")  + geom_hline(yintercept = -log10(0.05), linetype="dashed", col="grey") + geom_vline(xintercept=-log10(0.05), linetype="dashed", col="grey") + xlab("-log10(p value) from sc") + ylab("-log10(p value) from after decon") + coord_fixed(xlim=c(-5,11), ylim=c(-5,11)) + ggtitle("GSE134692, PC1 correction") + theme_bw()
+
+
+#### GSE134692, PC1-PC4 correction ####
+b <- ggplot(dat2, aes(x=-log10(P.value2), y=-log10(P.value), label=celltype, color=Term)) + geom_point() + geom_text_repel(size=3) + scale_color_discrete(labels=function(x) str_wrap(x, width = 35), name="pathway") +  geom_hline(yintercept = -log10(0.05), linetype="dashed", col="grey") + geom_vline(xintercept=-log10(0.05), linetype="dashed", col="grey") + xlab("-log10(p value) from sc") + ylab("-log10(p value) from after decon") + coord_fixed(xlim=c(-5,11), ylim=c(-5,11)) + ggtitle("GSE134692, PC1-PC4 correction") + theme_bw()
+
+
+#### GSE150910, PC1 correction ####
+c <- ggplot(dat3, aes(x=-log10(P.value2), y=-log10(P.value), label=celltype, color=Term)) + geom_point() + geom_text_repel(size=3) + scale_color_discrete(labels=function(x) str_wrap(x, width = 35), name="pathway") + geom_hline(yintercept = -log10(0.05), linetype="dashed", col="grey") + geom_vline(xintercept=-log10(0.05), linetype="dashed", col="grey") + xlab("-log10(p value) from sc") + ylab("-log10(p value) from after decon") + coord_fixed(xlim=c(0,11), ylim=c(0,11)) + ggtitle("GSE150910, PC1 correction") + theme_bw()
+
+
+#### GSE150910, PC1-PC4 correction ####
+d <- ggplot(dat4, aes(x=-log10(P.value2), y=-log10(P.value), label=celltype, color=Term)) + geom_point() + geom_text_repel(size=3) + scale_color_discrete(labels=function(x) str_wrap(x, width = 35), name="pathway") + geom_hline(yintercept = -log10(0.05), linetype="dashed", col="grey") + geom_vline(xintercept=-log10(0.05), linetype="dashed", col="grey") + xlab("-log10(p value) from sc") + ylab("-log10(p value) from after decon") + coord_fixed(xlim=c(0,10), ylim=c(0,10)) + ggtitle("GSE150910, PC1-PC4 correction") + theme_bw()
+
+
+gg <- list(b,d)
+# for(i in 1:length(gg)){
+#   ggsave(filename=paste("./main_figures/validation_", i, ".jpg", sep=""), plot=gg[[i]], width=7, height=5, device="jpeg", dpi=350)
+# }
+
+gg2 <- list(a,c)
+# for(i in 1:length(gg2)){
+#   ggsave(filename=paste("./supp_figures/validation_", i, ".jpg", sep=""), plot=gg2[[i]], width=7, height=5, device="jpeg", dpi=350)
+# }
+
+```
+
